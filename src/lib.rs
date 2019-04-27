@@ -1295,53 +1295,96 @@ enum MessageState {
 }
 
 /// Queues up bytes waiting for a complete gdb packet.
-pub struct GdbMessageReader {
+pub struct GdbMessageReader<H>
+where
+    H: Handler,
+{
     state: MessageState,
     data: Vec<u8>,
+    handler: H,
+    ack_mode: bool,
 }
 
-impl GdbMessageReader {
+impl<H> GdbMessageReader<H>
+where
+    H: Handler,
+{
     /// Create a new message reader.
-    pub fn new() -> Self {
+    pub fn new(handler: H) -> Self {
         GdbMessageReader {
             state: MessageState::Idle,
             data: Vec::new(),
+            handler,
+            ack_mode: true,
         }
     }
 
-    /// Handles the next byte removed from the gdb client.
-    /// Returns None if the message isn't yet complete.
-    /// Returns the buffer when the message can be processed. The message may be invalid and it is
-    /// the user's responsibility to verify the checksum.
-    pub fn next_byte(&mut self, byte: u8) -> Option<Vec<u8>> {
+    /// Handles the next byte received from the gdb client.
+    /// Responds to complete messages and errors on the `writer` using `handler` to process the
+    /// requests.
+    pub fn next_byte<W>(&mut self, byte: u8, mut writer: W)
+    where
+        W: Write,
+    {
         use MessageState::*;
 
         self.data.push(byte);
 
-        match self.state {
+        let complete = match self.state {
             Idle => {
                 if byte == b'$' {
                     self.state = ReceivePacket;
-                    None
+                    false
                 } else {
-                    // Not a begin message, either a +/- or invalid char.
-                    Some(std::mem::replace(&mut self.data, Vec::new()))
+                    // Not a begin message marker, either a +/- or invalid char.
+                    println!("invalid message: {:?}", self.data);
+                    true
                 }
             }
             ReceivePacket => {
                 if byte == b'#' {
                     self.state = ReceiveChecksum1;
                 }
-                None
+                false
             }
             ReceiveChecksum1 => {
                 self.state = ReceiveChecksum2;
-                None
+                false
             }
             ReceiveChecksum2 => {
                 self.state = Idle;
-                Some(std::mem::replace(&mut self.data, Vec::new()))
+                true
             }
+        };
+
+        if complete {
+            if let Some((_, packet)) = run_parser(&self.data) {
+                match packet {
+                    Packet::Data(data, checksum) => {
+                        let calc_checksum = data.iter().fold(0u8, |a, b| a.wrapping_add(*b));
+                        if calc_checksum != checksum {
+                            let _ = writer.write_all(&b"-"[..]); // Should propagate write error.
+                            self.data.clear();
+                            return;
+                        }
+
+                        // Write an ACK
+                        if self.ack_mode && !writer.write_all(&b"+"[..]).is_ok() {
+                            //TODO: propagate errors to caller?
+                            self.data.clear();
+                            return;
+                        }
+                        let no_ack_mode =
+                            handle_packet(&data, &self.handler, &mut writer).unwrap_or(false);
+                        if no_ack_mode {
+                            self.ack_mode = false;
+                        }
+                    }
+                    // Just ignore ACK/NACK/Interrupt
+                    _ => {}
+                };
+            }
+            self.data.clear();
         }
     }
 }
@@ -2016,4 +2059,29 @@ fn test_cond_or_command_list() {
             vec!(bytecode!('z' as u8), bytecode!['y' as u8; 16])
         )
     );
+}
+
+#[test]
+fn checksum_test() {
+    use std::io::Cursor;
+    let input = b"$g#66$g#67";
+    let mut output = Cursor::new(Vec::new());
+
+    struct DummyHandler {}
+    impl Handler for DummyHandler {
+        fn attached(&self, _pid: Option<u64>) -> Result<ProcessType, Error> {
+            Ok(ProcessType::Attached)
+        }
+        fn halt_reason(&self) -> Result<StopReason, Error> {
+            Ok(StopReason::Signal(5))
+        }
+    }
+
+    let handler = DummyHandler {};
+    let mut stub = GdbMessageReader::new(handler);
+
+    for b in input.into_iter() {
+        stub.next_byte(*b, &mut output);
+    }
+    assert_eq!(&output.get_ref()[0..2], b"-+");
 }
