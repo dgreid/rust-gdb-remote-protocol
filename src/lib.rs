@@ -1287,6 +1287,65 @@ fn run_parser(buf: &[u8]) -> Option<(usize, Packet)> {
     }
 }
 
+enum MessageState {
+    Idle,
+    ReceivePacket,
+    ReceiveChecksum1,
+    ReceiveChecksum2,
+}
+
+/// Queues up bytes waiting for a complete gdb packet.
+pub struct GdbMessageReader {
+    state: MessageState,
+    data: Vec<u8>,
+}
+
+impl GdbMessageReader {
+    /// Create a new message reader.
+    pub fn new() -> Self {
+        GdbMessageReader {
+            state: MessageState::Idle,
+            data: Vec::new(),
+        }
+    }
+
+    /// Handles the next byte removed from the gdb client.
+    /// Returns None if the message isn't yet complete.
+    /// Returns the buffer when the message can be processed. The message may be invalid and it is
+    /// the user's responsibility to verify the checksum.
+    pub fn next_byte(&mut self, byte: u8) -> Option<Vec<u8>> {
+        use MessageState::*;
+
+        self.data.push(byte);
+
+        match self.state {
+            Idle => {
+                if byte == b'$' {
+                    self.state = ReceivePacket;
+                    None
+                } else {
+                    // Not a begin message, either a +/- or invalid char.
+                    Some(std::mem::replace(&mut self.data, Vec::new()))
+                }
+            }
+            ReceivePacket => {
+                if byte == b'#' {
+                    self.state = ReceiveChecksum1;
+                }
+                None
+            }
+            ReceiveChecksum1 => {
+                self.state = ReceiveChecksum2;
+                None
+            }
+            ReceiveChecksum2 => {
+                self.state = Idle;
+                Some(std::mem::replace(&mut self.data, Vec::new()))
+            }
+        }
+    }
+}
+
 /// Read gdbserver packets from `reader` and call methods on `handler` to handle them and write
 /// responses to `writer`.
 pub fn process_packets_from<R, W, H>(reader: R, mut writer: W, handler: H)
