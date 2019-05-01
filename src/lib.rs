@@ -1295,26 +1295,18 @@ enum MessageState {
 }
 
 /// Queues up bytes waiting for a complete gdb packet.
-pub struct GdbMessageReader<H>
-where
-    H: Handler,
-{
+pub struct GdbMessageReader {
     state: MessageState,
     data: Vec<u8>,
-    handler: H,
     ack_mode: bool,
 }
 
-impl<H> GdbMessageReader<H>
-where
-    H: Handler,
-{
+impl GdbMessageReader {
     /// Create a new message reader.
-    pub fn new(handler: H) -> Self {
+    pub fn new() -> Self {
         GdbMessageReader {
             state: MessageState::Idle,
             data: Vec::new(),
-            handler,
             ack_mode: true,
         }
     }
@@ -1322,8 +1314,9 @@ where
     /// Handles the next byte received from the gdb client.
     /// Responds to complete messages and errors on the `writer` using `handler` to process the
     /// requests.
-    pub fn next_byte<W>(&mut self, byte: u8, mut writer: W)
+    pub fn next_byte<H, W>(&mut self, byte: u8, handler: &H, mut writer: W)
     where
+        H: Handler,
         W: Write,
     {
         use MessageState::*;
@@ -1375,7 +1368,7 @@ where
                             return;
                         }
                         let no_ack_mode =
-                            handle_packet(&data, &self.handler, &mut writer).unwrap_or(false);
+                            handle_packet(&data, handler, &mut writer).unwrap_or(false);
                         if no_ack_mode {
                             self.ack_mode = false;
                         }
@@ -2078,10 +2071,10 @@ fn checksum_test() {
     }
 
     let handler = DummyHandler {};
-    let mut stub = GdbMessageReader::new(handler);
+    let mut stub = GdbMessageReader::new();
 
     for b in input.into_iter() {
-        stub.next_byte(*b, &mut output);
+        stub.next_byte(*b, &handler, &mut output);
     }
     assert_eq!(&output.get_ref()[0..2], b"-+");
 }
