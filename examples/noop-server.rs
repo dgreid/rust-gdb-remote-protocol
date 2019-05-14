@@ -1,7 +1,9 @@
 extern crate env_logger;
 extern crate gdb_remote_protocol;
 
-use gdb_remote_protocol::{process_packets_from, Error, Handler, ProcessType, StopReason};
+use gdb_remote_protocol::{
+    process_packets_from, ContinueStatus, Error, Handler, ProcessType, StopReason,
+};
 use std::net::TcpListener;
 
 struct NoopHandler;
@@ -12,7 +14,19 @@ impl Handler for NoopHandler {
     }
 
     fn halt_reason(&self) -> Result<StopReason, Error> {
-        Ok(StopReason::Exited(23, 0))
+        Ok(StopReason::Signal(5))
+    }
+
+    fn interrupt(&self) -> Result<StopReason, Error> {
+        Ok(StopReason::Signal(5))
+    }
+
+    fn read_general_registers(&self) -> Result<Vec<u8>, Error> {
+        Ok(vec![0; 64])
+    }
+
+    fn cont(&self, _addr: Option<u64>) -> Result<ContinueStatus, Error> {
+        Ok(ContinueStatus {})
     }
 }
 

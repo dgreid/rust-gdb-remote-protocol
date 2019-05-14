@@ -250,6 +250,8 @@ impl MemoryRegion {
 /// [1]: https://sourceware.org/gdb/onlinedocs/gdb/Packets.html#Packets
 #[derive(Clone, Debug, PartialEq)]
 enum Command<'a> {
+    /// Continue execution optionally from the specified address.
+    Continue(Option<u64>),
     /// Detach from a process or from all processes.
     Detach(Option<u64>),
     /// Enable extended mode.
@@ -653,6 +655,7 @@ fn command<'a>(i: &'a [u8]) -> IResult<&'a [u8], Command<'a>> {
          tag!("!") => { |_|   Command::EnableExtendedMode }
          | tag!("?") => { |_| Command::TargetHaltReason }
          | parse_d_packet => { |pid| Command::Detach(pid) }
+         | tag!("c") => { |_| Command::Continue(None) } // TODO(dgreid) - handle address.
          | tag!("g") => { |_| Command::ReadGeneralRegisters }
          | write_general_registers => { |bytes| Command::WriteGeneralRegisters(bytes) }
          | parse_h_packet => { |thread_id| Command::SetCurrentThread(thread_id) }
@@ -731,6 +734,9 @@ pub enum StopReason {
     // Exec(String),
     // NewThread(ThreadId),
 }
+
+/// Empty type to separate the success of the cont command.
+pub struct ContinueStatus {}
 
 /// This trait should be implemented by servers.  Methods in the trait
 /// generally default to returning `Error::Unimplemented`; but some
@@ -838,6 +844,16 @@ pub trait Handler {
     /// Return the reason that the inferior has halted.
     fn halt_reason(&self) -> Result<StopReason, Error>;
 
+    /// Continue Execution of the program.
+    fn cont(&self, _addr: Option<u64>) -> Result<ContinueStatus, Error> {
+        Err(Error::Unimplemented)
+    }
+
+    /// Signal that the client sent an interrupt.
+    fn interrupt(&self) -> Result<StopReason, Error> {
+        Err(Error::Unimplemented)
+    }
+
     /// Invoke a command.  The command is just a sequence of bytes
     /// (typically ASCII characters), to be interpreted by the server
     /// in any way it likes.  The result is output to send back to the
@@ -939,6 +955,7 @@ fn compute_checksum_incremental(bytes: &[u8], init: u8) -> u8 {
 
 #[derive(Debug)]
 enum Response<'a> {
+    NoResponse,
     Empty,
     Ok,
     Error(u8),
@@ -967,6 +984,12 @@ where
 impl<'a> From<()> for Response<'a> {
     fn from(_: ()) -> Self {
         Response::Ok
+    }
+}
+
+impl<'a> From<ContinueStatus> for Response<'a> {
+    fn from(_: ContinueStatus) -> Self {
+        Response::NoResponse
     }
 }
 
@@ -1074,7 +1097,11 @@ fn write_response<W>(response: Response, writer: &mut W) -> io::Result<()>
 where
     W: Write,
 {
-    trace!("Response: {:?}", response);
+    error!("Response: {:?}", response);
+    match response {
+        Response::NoResponse => return Ok(()),
+        _ => (),
+    }
     write!(writer, "$")?;
 
     let mut writer = PacketWriter::new(writer);
@@ -1082,6 +1109,7 @@ where
         Response::Ok => {
             write!(writer, "OK")?;
         }
+        Response::NoResponse => {}
         Response::Empty => {}
         Response::Error(val) => {
             write!(writer, "E{:02x}", val)?;
@@ -1166,19 +1194,31 @@ where
     Response::String(Cow::Owned(features.join(";")) as Cow<str>)
 }
 
+/// Handle a signal sent from the client.
+fn handle_ctrl_c<H, W>(handler: &H, writer: &mut W) -> io::Result<()>
+where
+    H: Handler,
+    W: Write,
+{
+    error!("Got CtrlC");
+    Ok(())
+}
+
 /// Handle a single packet `data` with `handler` and write a response to `writer`.
 fn handle_packet<H, W>(data: &[u8], handler: &H, writer: &mut W) -> io::Result<bool>
 where
     H: Handler,
     W: Write,
 {
-    debug!("Command: {}", String::from_utf8_lossy(data));
+    error!("Command: {}", String::from_utf8_lossy(data));
     let mut no_ack_mode = false;
     let response = if let Done(_, command) = command(data) {
+        error!("parsed: {:?}", command);
         match command {
             // We unconditionally support extended mode.
             Command::EnableExtendedMode => Response::Ok,
             Command::TargetHaltReason => handler.halt_reason().into(),
+            Command::Continue(_) => handler.cont(None).into(),
             Command::ReadGeneralRegisters => handler.read_general_registers().into(),
             Command::WriteGeneralRegisters(bytes) => {
                 handler.write_general_registers(&bytes[..]).into()
@@ -1280,6 +1320,7 @@ fn offset(from: &[u8], to: &[u8]) -> usize {
 }
 
 fn run_parser(buf: &[u8]) -> Option<(usize, Packet)> {
+    error!("parse buf {:?}", &buf[..]);
     if let Done(rest, packet) = packet_or_response(buf) {
         Some((offset(buf, rest), packet))
     } else {
@@ -1328,6 +1369,8 @@ impl GdbMessageReader {
                 if byte == b'$' {
                     self.state = ReceivePacket;
                     false
+                } else if byte == b'\x03' {
+                    true
                 } else {
                     // Not a begin message marker, either a +/- or invalid char.
                     println!("invalid message: {:?}", self.data);
@@ -1373,7 +1416,11 @@ impl GdbMessageReader {
                             self.ack_mode = false;
                         }
                     }
-                    // Just ignore ACK/NACK/Interrupt
+                    Packet::Interrupt => {
+                        let response = handler.interrupt().into();
+                        let _ = write_response(response, &mut writer);
+                    }
+                    // Just ignore ACK/NACK
                     _ => {}
                 };
             }
@@ -1412,7 +1459,11 @@ where
                             ack_mode = false;
                         }
                     }
-                    // Just ignore ACK/NACK/Interrupt
+                    Packet::Interrupt => {
+                        let response = handler.interrupt().into();
+                        let _ = write_response(response, &mut writer);
+                    }
+                    // Just ignore ACK/NACK
                     _ => {}
                 };
                 len
@@ -1691,6 +1742,11 @@ fn test_parse_thread_id() {
             }
         )
     );
+}
+
+#[test]
+fn test_c_command() {
+    assert_eq!(command(&b"c"[..]), Done(&b""[..], Command::Continue(None)));
 }
 
 #[test]

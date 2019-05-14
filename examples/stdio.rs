@@ -1,8 +1,9 @@
 extern crate env_logger;
 extern crate gdb_remote_protocol;
 
-use gdb_remote_protocol::{process_packets_from, Error, Handler, ProcessType, StopReason};
-use std::net::TcpListener;
+use gdb_remote_protocol::{
+    process_packets_from, ContinueStatus, Error, Handler, ProcessType, StopReason,
+};
 
 struct NoopHandler;
 
