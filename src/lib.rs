@@ -1194,16 +1194,6 @@ where
     Response::String(Cow::Owned(features.join(";")) as Cow<str>)
 }
 
-/// Handle a signal sent from the client.
-fn handle_ctrl_c<H, W>(handler: &H, writer: &mut W) -> io::Result<()>
-where
-    H: Handler,
-    W: Write,
-{
-    error!("Got CtrlC");
-    Ok(())
-}
-
 /// Handle a single packet `data` with `handler` and write a response to `writer`.
 fn handle_packet<H, W>(data: &[u8], handler: &H, writer: &mut W) -> io::Result<bool>
 where
@@ -1350,6 +1340,14 @@ impl GdbMessageReader {
             data: Vec::new(),
             ack_mode: true,
         }
+    }
+
+    /// Reset the reader to idle. This is useful if there is a client error or if a client
+    /// reattaches and should start from the beginning.
+    pub fn reset(&mut self) {
+        self.state = MessageState::Idle;
+        self.data.flush();
+        self.ack_mode = true;
     }
 
     /// Handles the next byte received from the gdb client.
